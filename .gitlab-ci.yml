@@ -1,0 +1,248 @@
+# ============================================================================
+# .gitlab-ci.yml — Snowflake DCM Projects CI/CD Pipeline
+# HR Analytics Platform | Author: Satish Kumar | @snowflakechronicles
+# ============================================================================
+#
+# Pipeline structure:
+#   MR Opened  → plan:dev + plan:stage + plan:prod (parallel)
+#   Merge/Push → deploy:stage → test:stage → deploy:prod (manual approval)
+#
+# Required GitLab CI/CD Variables (Settings → CI/CD → Variables):
+#   SNOWFLAKE_ACCOUNT      Snowflake account identifier (e.g. PQC86579)
+#   SNOWFLAKE_USER         Service account username
+#   SNOWFLAKE_PASSWORD     Service account password  [MASKED]
+#   SNOWFLAKE_ROLE_DEV     HR_DCM_DEV_DEPLOYER
+#   SNOWFLAKE_ROLE_STG     HR_DCM_STG_DEPLOYER
+#   SNOWFLAKE_ROLE_PROD    HR_DCM_PROD_DEPLOYER
+#   DCM_PROJECT_PATH       snow://workspace/USER$.PUBLIC.DEFAULT$/versions/live/my_hr_dcm_project
+# ============================================================================
+
+image: python:3.11-slim
+
+# ── Shared variables ────────────────────────────────────────────────────────
+variables:
+  SNOW_CLI_VERSION: "3.16.0"
+  DCM_ADMIN_DB:     "HR_DCM_ADMIN"
+  DCM_SCHEMA:       "PROJECTS"
+
+# ── Pipeline stages ─────────────────────────────────────────────────────────
+stages:
+  - validate
+  - plan
+  - deploy_stage
+  - test_stage
+  - deploy_prod
+  - notify
+
+# ── Reusable setup ───────────────────────────────────────────────────────────
+.setup_snow_cli: &setup_snow_cli
+  before_script:
+    - pip install snowflake-cli-labs==${SNOW_CLI_VERSION} --quiet
+    - snow --version
+    - |
+      mkdir -p ~/.snowflake
+      cat > ~/.snowflake/config.toml <<EOF
+      [connections.default]
+      account   = "${SNOWFLAKE_ACCOUNT}"
+      user      = "${SNOWFLAKE_USER}"
+      password  = "${SNOWFLAKE_PASSWORD}"
+      warehouse = "SHARED_WH"
+      EOF
+    - echo "Snowflake CLI configured for account ${SNOWFLAKE_ACCOUNT}"
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAGE: validate
+# ════════════════════════════════════════════════════════════════════════════
+
+validate:manifest:
+  stage: validate
+  <<: *setup_snow_cli
+  script:
+    - echo "Validating manifest.yml structure..."
+    - python -c "
+      import yaml, sys
+      with open('manifest.yml') as f:
+          m = yaml.safe_load(f)
+      assert m.get('manifest_version') == 2, 'manifest_version must be 2'
+      assert 'targets' in m, 'targets section missing'
+      assert 'templating' in m, 'templating section missing'
+      print('manifest.yml is valid')
+      "
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+validate:sql_files:
+  stage: validate
+  script:
+    - echo "Checking all 9 definition files exist..."
+    - |
+      for f in 01_infrastructure 02_tables 03_dynamic_tables 04_views \
+                05_functions 06_tasks 07_grants 08_data_quality 09_security; do
+        if [ ! -f "sources/definitions/${f}.sql" ]; then
+          echo "MISSING: sources/definitions/${f}.sql"
+          exit 1
+        fi
+        echo "OK: ${f}.sql"
+      done
+    - echo "All 9 definition files present"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAGE: plan (dry run — no changes applied)
+# ════════════════════════════════════════════════════════════════════════════
+
+plan:dev:
+  stage: plan
+  <<: *setup_snow_cli
+  variables:
+    SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE_DEV}
+  script:
+    - echo "Running PLAN against DEV..."
+    - |
+      snow sql -q "
+        USE ROLE ${SNOWFLAKE_ROLE_DEV};
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_DEV
+          PLAN
+          USING CONFIGURATION DEV
+        FROM '${DCM_PROJECT_PATH}';
+      " --connection default
+    - echo "DEV plan completed"
+  artifacts:
+    reports:
+      dotenv: plan_dev.env
+    paths:
+      - plan_dev.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+plan:stage:
+  stage: plan
+  <<: *setup_snow_cli
+  script:
+    - echo "Running PLAN against STAGE..."
+    - |
+      snow sql -q "
+        USE ROLE ${SNOWFLAKE_ROLE_STG};
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_STG
+          PLAN
+          USING CONFIGURATION STAGE
+        FROM '${DCM_PROJECT_PATH}';
+      " --connection default
+    - echo "STAGE plan completed"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+plan:prod:
+  stage: plan
+  <<: *setup_snow_cli
+  script:
+    - echo "Running PLAN against PROD..."
+    - |
+      snow sql -q "
+        USE ROLE ${SNOWFLAKE_ROLE_PROD};
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_PROD
+          PLAN
+          USING CONFIGURATION PROD
+        FROM '${DCM_PROJECT_PATH}';
+      " --connection default
+    - echo "PROD plan completed"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAGE: deploy_stage
+# ════════════════════════════════════════════════════════════════════════════
+
+deploy:stage:
+  stage: deploy_stage
+  <<: *setup_snow_cli
+  environment:
+    name: stage
+    url: https://app.snowflake.com
+  script:
+    - echo "Deploying to STAGE..."
+    - |
+      snow sql -q "
+        USE ROLE ${SNOWFLAKE_ROLE_STG};
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_STG
+          DEPLOY AS 'gitlab-ci deploy \${CI_COMMIT_SHORT_SHA} to stage'
+          USING CONFIGURATION STAGE
+        FROM '${DCM_PROJECT_PATH}';
+      " --connection default
+    - echo "STAGE deployment complete"
+    - |
+      snow sql -q "
+        SHOW ENTITIES IN DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_STG;
+      " --connection default
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAGE: test_stage
+# ════════════════════════════════════════════════════════════════════════════
+
+test:stage:
+  stage: test_stage
+  <<: *setup_snow_cli
+  script:
+    - echo "Running TEST ALL on STAGE..."
+    - |
+      snow sql -q "
+        USE ROLE ${SNOWFLAKE_ROLE_STG};
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_STG TEST ALL;
+      " --connection default
+    - echo "STAGE data quality tests complete"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAGE: deploy_prod  (manual approval required)
+# ════════════════════════════════════════════════════════════════════════════
+
+deploy:prod:
+  stage: deploy_prod
+  <<: *setup_snow_cli
+  environment:
+    name: production
+    url: https://app.snowflake.com
+  when: manual
+  allow_failure: false
+  script:
+    - echo "Deploying to PROD (manually approved)..."
+    - |
+      snow sql -q "
+        USE ROLE ${SNOWFLAKE_ROLE_PROD};
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_PROD
+          DEPLOY AS 'gitlab-ci deploy \${CI_COMMIT_SHORT_SHA} to prod'
+          USING CONFIGURATION PROD
+        FROM '${DCM_PROJECT_PATH}';
+      " --connection default
+    - echo "PROD deployment complete"
+    - |
+      snow sql -q "
+        EXECUTE DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_PROD TEST ALL;
+        SHOW DEPLOYMENTS IN DCM PROJECT ${DCM_ADMIN_DB}.${DCM_SCHEMA}.HR_PROJECT_PROD;
+      " --connection default
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAGE: notify
+# ════════════════════════════════════════════════════════════════════════════
+
+notify:success:
+  stage: notify
+  script:
+    - echo "Pipeline completed successfully for commit ${CI_COMMIT_SHORT_SHA}"
+    - echo "Branch - ${CI_COMMIT_BRANCH}"
+    - echo "Author - ${CI_COMMIT_AUTHOR}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success

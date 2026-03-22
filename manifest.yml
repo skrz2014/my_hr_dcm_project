@@ -1,0 +1,49 @@
+manifest_version: 2
+type: DCM_PROJECT
+default_target: DCM_DEV
+
+targets:
+  DCM_DEV:
+    account_identifier: PQC86579
+    project_name: HR_DCM_ADMIN.PROJECTS.HR_PROJECT_DEV
+    project_owner: HR_DCM_DEV_DEPLOYER
+    templating_config: DEV
+
+  DCM_STG:
+    account_identifier: PQC86579
+    project_name: HR_DCM_ADMIN.PROJECTS.HR_PROJECT_STG
+    project_owner: HR_DCM_STG_DEPLOYER
+    templating_config: STAGE
+
+  DCM_PROD:
+    account_identifier: PQC86579
+    project_name: HR_DCM_ADMIN.PROJECTS.HR_PROJECT_PROD
+    project_owner: HR_DCM_PROD_DEPLOYER
+    templating_config: PROD
+
+templating:
+  defaults:
+    env: "DEV"
+    warehouse: "SHARED_WH"
+    wh_size: "SMALL"
+    auto_suspend: 300
+    data_retention_days: 7
+
+  configurations:
+    DEV:
+      env: "DEV"
+      wh_size: "X-SMALL"
+      auto_suspend: 60
+      data_retention_days: 1
+
+    STAGE:
+      env: "STG"
+      wh_size: "SMALL"
+      auto_suspend: 300
+      data_retention_days: 7
+
+    PROD:
+      env: "PROD"
+      wh_size: "LARGE"
+      auto_suspend: 600
+      data_retention_days: 90
